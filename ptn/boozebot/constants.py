@@ -98,6 +98,8 @@ RACKHAMS_PEAK_POP = 150000
 
 EMBED_COLOUR_ERROR = 0x800000
 
+wco_image_url = "https://cdn.discordapp.com/role-icons/839149899596955708/2d8298304adbadac79679171ab7f0ae6.webp?quality=lossless"
+
 ping_response_messages = [
     'Yarrr, <@{message_author_id}>, you summoned me?',
     'https://tenor.com/view/hello-there-baby-yoda-mandolorian-hello-gif-20136589',
@@ -214,7 +216,7 @@ if not os.path.exists(os.path.dirname(CARRIERS_DB_PATH)):
 if not os.path.exists(os.path.dirname(CARRIERS_DB_DUMPS_PATH)):
     print(f'Folder {os.path.dirname(CARRIERS_DB_DUMPS_PATH)} does not exist, making it now.')
     os.makedirs(os.path.dirname(CARRIERS_DB_DUMPS_PATH))
-    
+
 # check the settings folder exists
 if not os.path.exists(SETTINGS_PATH):
     print(f'Folder {SETTINGS_PATH} does not exist, making it now.')
@@ -224,15 +226,15 @@ if not os.path.exists(SETTINGS_PATH):
 old_db_path = os.path.join(os.path.expanduser('~'), 'boozedatabase', 'booze_carriers.db')
 if os.path.exists(old_db_path) and not os.path.exists(CARRIERS_DB_PATH):
     os.rename(old_db_path, CARRIERS_DB_PATH)
-    
+
 old_db_dumps_path = os.path.join(os.path.expanduser('~'), 'boozedatabase', 'dumps', 'booze_carriers.sql')
 if os.path.exists(old_db_dumps_path) and not os.path.exists(CARRIERS_DB_DUMPS_PATH):
     os.rename(old_db_dumps_path, CARRIERS_DB_DUMPS_PATH)
-    
+
 old_wine_carrier_welcome = os.path.join('wine_carrier_welcome.txt')
 if os.path.exists(old_wine_carrier_welcome) and not os.path.exists(WELCOME_MESSAGE_FILE_PATH):
     os.rename(old_wine_carrier_welcome, WELCOME_MESSAGE_FILE_PATH)
-    
+
 old_google_oauth_credentials_path = os.path.join(os.path.expanduser('~'), '.ptnboozebot.json')
 if os.path.exists(old_google_oauth_credentials_path) and not os.path.exists(GOOGLE_OAUTH_CREDENTIALS_PATH):
     os.rename(old_google_oauth_credentials_path, GOOGLE_OAUTH_CREDENTIALS_PATH)
@@ -454,7 +456,7 @@ def bot_spam_channel():
 def wine_carrier_command_channel():
     """
     Gets the rackhams space traffic control channel
-    
+
     :return: The channel ID
     :rtype: int
     """
@@ -486,7 +488,7 @@ def get_feedback_channel_id():
     :rtype: int
     """
     return PROD_FEEDBACK_CHANNEL_ID if _production else TEST_FEEDBACK_CHANNEL_ID
-  
+
 def get_pilot_role_id():
     """
     Gets the ID of the pilot role

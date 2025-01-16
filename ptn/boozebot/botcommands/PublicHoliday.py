@@ -5,25 +5,28 @@ Cog for PH check commands and loop
 
 # libraries
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # discord.py
 import discord
-from discord.app_commands import Group, describe, Choice
+from discord.app_commands import describe
 from discord.ext import commands, tasks
 from discord import app_commands, NotFound
 
 # local constants
-from ptn.boozebot.constants import rackhams_holiday_channel, bot, bot_guild_id, server_council_role_ids, \
+from ptn.boozebot.constants import rackhams_holiday_channel, bot, server_council_role_ids, \
     server_sommelier_role_id, server_mod_role_id, server_connoisseur_role_id, holiday_query_not_started_gifs, \
     holiday_query_started_gifs, holiday_start_gif, holiday_ended_gif, get_steve_says_channel, \
     get_wine_carrier_channel, wine_carrier_command_channel, get_primary_booze_discussions_channel
 
 # local modules
-from ptn.boozebot.modules.ErrorHandler import on_app_command_error, GenericError, CustomError, on_generic_error
-from ptn.boozebot.modules.helpers import bot_exit, check_roles, check_command_channel
+from ptn.boozebot.modules.ErrorHandler import on_app_command_error
+from ptn.boozebot.modules.helpers import check_roles, check_command_channel
 from ptn.boozebot.database.database import pirate_steve_db, pirate_steve_conn
 from ptn.boozebot.modules.PHcheck import ph_check
+
+
+DT_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 """
 PUBLIC HOLIDAY TASK LOOP
@@ -54,14 +57,14 @@ class PublicHoliday(commands.Cog):
     def cog_unload(self):
         tree = self.bot.tree
         tree.on_error = self._old_tree_error
-        
+
     """
     The public holiday state checker mechanism for booze bot.
     """
 
     admin_override_state = False
     rackhams_holiday_active = False
-    
+
     @commands.Cog.listener()
     async def on_ready(self):
         print("Starting the public holiday state checker")
@@ -116,10 +119,10 @@ class PublicHoliday(commands.Cog):
                 )
                 timestamp = pirate_steve_db.fetchone()
 
-                start_time = datetime.strptime(dict(timestamp).get('timestamp'), '%Y-%m-%d %H:%M:%S')
+                start_time = datetime.fromtimestamp(dict(timestamp).get('timestamp'), tz=timezone.utc)
                 end_time = start_time + timedelta(hours=48)
 
-                current_time_utc = datetime.strptime(datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), '%Y-%m-%d %H:%M:%S')
+                current_time_utc = datetime.now(tz=timezone.utc).replace(microsecond=0)
                 print('No PH detected, next check in 10 mins.')
 
                 if current_time_utc > end_time:
@@ -148,7 +151,7 @@ class PublicHoliday(commands.Cog):
         except Exception as e:
             print(f'Error in the public holiday loop: {e}')
 
-    
+
     @app_commands.command(name="booze_started", description="Returns a GIF for whether the holiday has started.")
     @check_roles([server_connoisseur_role_id(), server_sommelier_role_id(), server_mod_role_id(), *server_council_role_ids()])
     async def holiday_query(self, interaction: discord.Interaction):
@@ -186,7 +189,7 @@ class PublicHoliday(commands.Cog):
         print(f'{interaction.user.name} requested to override the admin holiday state too: {state}.')
         PublicHoliday.admin_override_state = state
         await interaction.response.send_message(f'Set the admin holiday flag to: {state}. Check with /booze_started.')
-        
+
     @app_commands.command(name="booze_timestamp_admin_override",
                           description="Overrides the holiday start time."
                                       "Used to set the cruise start time used to get the duration")
@@ -195,9 +198,9 @@ class PublicHoliday(commands.Cog):
     @check_command_channel([get_steve_says_channel()])
     async def admin_override_start_timestamp(self, interaction: discord.Interaction, timestamp: str):
         print(f'{interaction.user.name} requested to override the start time to: {timestamp}.')
-        
+
         try:
-            datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S')
+            datetime.strptime(timestamp, DT_FORMAT)
         except ValueError:
             await interaction.response.send_message(f'Invalid timestamp format. Please use YYYY-MM-DD HH:MI:SS.', ephemeral=True)
             return
@@ -216,13 +219,13 @@ class PublicHoliday(commands.Cog):
                 f'''UPDATE holidaystate SET state=TRUE, timestamp=\'{timestamp}\''''
             )
             pirate_steve_conn.commit()
-            
+
             await interaction.response.send_message(f'Set the cruise start time to: {timestamp}. Check with /booze_duration_remaining.')
-            
+
         else:
             print('Holiday was not ongoing')
-            await interaction.response.send_message(f'No holiday has been detected yet, Wait until steve detects the holiday before using this command.')
-        
+            await interaction.response.send_message('No holiday has been detected yet, Wait until steve detects the holiday before using this command.')
+
 
     @app_commands.command(name="booze_duration_remaining", description="Returns roughly how long the holiday has remaining.")
     @check_command_channel([get_wine_carrier_channel(), get_steve_says_channel(), wine_carrier_command_channel(), get_primary_booze_discussions_channel()])
@@ -243,7 +246,7 @@ class PublicHoliday(commands.Cog):
         )
         timestamp = pirate_steve_db.fetchone()
 
-        start_time = datetime.strptime(dict(timestamp).get('timestamp'), '%Y-%m-%d %H:%M:%S')
+        start_time = datetime.strptime(dict(timestamp).get('timestamp'), DT_FORMAT)
         end_time = start_time + timedelta(hours=duration_hours)
         end_timestamp = int(end_time.timestamp())
         print(f'End time calculated as: {end_time}. Which is epoch of: {end_timestamp}')

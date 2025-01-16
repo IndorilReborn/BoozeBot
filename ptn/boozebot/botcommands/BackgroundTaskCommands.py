@@ -5,7 +5,7 @@ from discord import app_commands
 from discord.app_commands import Choice, describe
 
 # local constants
-from ptn.boozebot.constants import bot, server_mod_role_id, server_sommelier_role_id, server_connoisseur_role_id, server_council_role_ids, get_steve_says_channel
+from ptn.boozebot.constants import bot, server_mod_role_id, server_sommelier_role_id, server_council_role_ids, get_steve_says_channel
 
 # local modules
 from ptn.boozebot.modules.helpers import check_roles, check_command_channel
@@ -61,9 +61,9 @@ class BackgroundTaskCommands(commands.Cog):
             else:
                 await interaction.response.send_message(f"Task {task_name} is not running.")
         else:
-            await interaction.response.send_message(f"Task {task_name} not found.", ephemeral=True)            
-          
-    
+            await interaction.response.send_message(f"Task {task_name} not found.", ephemeral=True)
+
+
     @app_commands.command(name="task_status", description="Gets the status of a background task.")
     @check_roles([server_mod_role_id(), server_sommelier_role_id(), *server_council_role_ids()])
     @check_command_channel(get_steve_says_channel())
@@ -84,8 +84,8 @@ class BackgroundTaskCommands(commands.Cog):
             await interaction.response.send_message(f"Task {task_name} is currently {status}.")
         else:
             await interaction.response.send_message(f"Task {task_name} not found.", ephemeral=True)
-    
-    
+
+
     def get_task(self, task_name: str):
         tasks = {
             "periodic_stat_update": bot.get_cog("DatabaseInteraction").periodic_stat_update,
@@ -93,4 +93,3 @@ class BackgroundTaskCommands(commands.Cog):
             "public_holiday_loop": bot.get_cog("PublicHoliday").public_holiday_loop,
         }
         return tasks.get(task_name)
-    
