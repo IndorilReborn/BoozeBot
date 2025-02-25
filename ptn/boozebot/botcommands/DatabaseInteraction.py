@@ -7,19 +7,16 @@ Cog for all the commands that interact with the database
 import asyncio
 import logging
 import sqlite3
-from datetime import datetime, timedelta
 import math
-import os.path
 import re
-import gspread
-import gspread_asyncio
-from google.oauth2.service_account import Credentials
+from csv import DictReader, DictWriter
+from datetime import datetime, timedelta
+from tempfile import NamedTemporaryFile
 
-# discord.py
 import discord
-from discord.app_commands import Group, describe, Choice
+from discord.app_commands import describe
 from discord.ext import commands, tasks
-from discord import app_commands, NotFound
+from discord import app_commands
 
 # local constants
 from ptn.boozebot.constants import (
@@ -37,7 +34,6 @@ from ptn.boozebot.constants import (
     server_connoisseur_role_id,
     get_wine_carrier_channel,
     get_primary_booze_discussions_channel,
-    GOOGLE_OAUTH_CREDENTIALS_PATH,
     _production,
 )
 
@@ -45,13 +41,8 @@ from ptn.boozebot.constants import (
 from ptn.boozebot.classes.BoozeCarrier import BoozeCarrier
 
 # local modules
-from ptn.boozebot.modules.ErrorHandler import (
-    on_app_command_error,
-    GenericError,
-    CustomError,
-    on_generic_error,
-)
-from ptn.boozebot.modules.helpers import bot_exit, check_roles, check_command_channel
+from ptn.boozebot.modules.ErrorHandler import on_app_command_error
+from ptn.boozebot.modules.helpers import check_roles, check_command_channel
 from ptn.boozebot.database.database import (
     pirate_steve_db,
     pirate_steve_conn,
@@ -85,60 +76,13 @@ DATABASE INTERACTION COMMANDS
 """
 
 
-def get_creds():
-    creds = Credentials.from_service_account_file(GOOGLE_OAUTH_CREDENTIALS_PATH)
-    scoped = creds.with_scopes([
-        "https://spreadsheets.google.com/feeds",
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ])
-    return scoped
-
 class DatabaseInteraction(commands.Cog):
 
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        # Things that will be set later in the async functions
-        self._old_tree_error = None
-        self.client = None
-        self.tracking_sheet = None
-        self.worksheet_key = None
-        self.worksheet_with_data_id = None
-        self.loader_signup_form_url = None
-        self.client_manager = None
-
-        if not os.path.exists(GOOGLE_OAUTH_CREDENTIALS_PATH):
-            raise EnvironmentError("Cannot find the booze cruise json file.")
-
         self.update_allowed = True  # This might be better stored somewhere over a reset
-
-        # authorize the client sheet
-        self.client_manager = gspread_asyncio.AsyncioGspreadClientManager(get_creds)
-
-    # custom global error handler
-    # attaching the handler when the cog is loaded
-    # and storing the old handler
-    async def cog_load(self):
-        tree = self.bot.tree
-        self._old_tree_error = tree.on_error
-        tree.on_error = on_app_command_error
-
-        pirate_steve_db.execute("SELECT * FROM trackingforms")
-        forms = dict(pirate_steve_db.fetchone())
-
-        self.worksheet_key = forms["worksheet_key"]
-
-        # On which sheet is the actual data.
-        self.worksheet_with_data_id = forms["worksheet_with_data_id"]
-
-        # input form is the form we have loaders fill in
-        self.loader_signup_form_url = forms["loader_input_form_url"]
-
-        self.client = await self.client_manager.authorize()
-
-        await self._reconfigure_workbook_and_form()
-        await self._update_db()  # On instantiation, go build the DB
+        self.signups_allowed = False
 
 
     # detaching the handler when the cog is unloaded
@@ -146,45 +90,17 @@ class DatabaseInteraction(commands.Cog):
         tree = self.bot.tree
         tree.on_error = self._old_tree_error
 
-    async def _reconfigure_workbook_and_form(self):
-        """
-        Reconfigures the tracking sheet to the latest version based on the current worksheet key and sheet ID. Called
-        when we update the forms or on startup of the bot.
 
-        :returns: None
-        """
-        # The key is part of the URL
-        try:
-            logging.info(f"Building worksheet with the key: {self.worksheet_key}")
-            self.client = await self.client_manager.authorize()
-            workbook = await self.client.open_by_key(self.worksheet_key)
-
-            worksheets = await workbook.worksheets()
-            for sheet in worksheets:
-                print(sheet.title)
-
-            # Update the tracking sheet object
-            self.tracking_sheet = await workbook.get_worksheet(self.worksheet_with_data_id)
-        except gspread.exceptions.APIError as e:
-            logging.exception(f"Error reading the worksheet: {e}")
-
-    async def _update_db(self):
+    def _update_db(self, csv_file: str):
         """
         Private method to wrap the DB update commands.
 
         :returns:
         :rtype:
         """
-        if not self.tracking_sheet:
-            raise EnvironmentError(
-                "Sorry this cannot be ran as we have no form for tracking the wine presently. "
-                "Please set a new form first."
-            )
 
-        elif not self.update_allowed:
-            print(
-                "Update not allowed, user has archived the data but not polled the latest set."
-            )
+        if not self.update_allowed:
+            print("Update not allowed, user has archived the data but not polled the latest set.")
             return
 
         updated_db = False
@@ -192,8 +108,8 @@ class DatabaseInteraction(commands.Cog):
         updated_count = 0
         unchanged_count = 0
         # A JSON form tracking all the records
-        self.client = await self.client_manager.authorize()
-        records_data = await self.tracking_sheet.get_all_records()
+        with open(csv_file, newline="") as csvfile:
+            records_data = list(DictReader(csvfile))
         new_signups = []  # type: list[discord.Embed]
 
         total_entries = len(records_data)
@@ -206,7 +122,7 @@ class DatabaseInteraction(commands.Cog):
             try:
                 carrier_data = BoozeCarrier(record)
 
-                # Check if there is already a object for this carrier and update it if so
+                # Check if there is already an object for this carrier and update it if so
                 if carrier_data.carrier_identifier in all_carriers_data:
 
                     all_carriers_data[carrier_data.carrier_identifier].wine_total += carrier_data.wine_total
@@ -215,18 +131,14 @@ class DatabaseInteraction(commands.Cog):
                 else:
                     all_carriers_data[carrier_data.carrier_identifier] = carrier_data
             except ValueError as ex:
-                print(f"Error while paring the stats into carrier records: {ex}")
+                print(f"Error while parsing the stats into carrier records: {ex}")
                 return
 
         print(f"Total Carriers: {len(all_carriers_data)}")
 
-        for carrier_data in all_carriers_data.items():
-
-            carrier_data = carrier_data[1]
-
+        for carrier_id, carrier_data in all_carriers_data.items():
             pirate_steve_db.execute(
-                "SELECT * FROM boozecarriers WHERE carrierid LIKE (?)",
-                (f'%{carrier_data.carrier_identifier}%',),
+                "SELECT * FROM boozecarriers WHERE carrierid LIKE (?)", (f'%{carrier_id}%',),
             )
 
             old_carrier_data = [
@@ -235,8 +147,7 @@ class DatabaseInteraction(commands.Cog):
 
             if len(old_carrier_data) > 1:
                 raise ValueError(
-                    f"{len(old_carrier_data)} carriers are listed with this carrier ID:"
-                    f' {carrier_data.carrier_identifier}. Problem in the DB!'
+                    f"{len(old_carrier_data)} carriers are listed with this carrier ID: {carrier_id}. Problem in the DB!"
                 )
 
             # If the carrier is in the database, check if the data is the same
@@ -509,7 +420,7 @@ class DatabaseInteraction(commands.Cog):
             if target_date
             else ""
         )
-        
+
         updated_timestamp = f"\n\nLast updated: <t:{int(datetime.now().timestamp())}:F>" if include_timestamp else ""
 
         # Build the embed
@@ -527,7 +438,7 @@ class DatabaseInteraction(commands.Cog):
             f"**Total profit:** — {total_profit:,}\n\n"
             f"**Total number of fleet carriers that profit can buy:** — {fleet_carrier_buy_count:,.2f}\n\n"
             f"{flavour_text}\n\n"
-            f"[Bringing wine? Sign up here]({self.loader_signup_form_url})"
+            f"Bringing wine? Sign up using the `/booze_carrier_signup` command!"  # TODO
             f"{updated_timestamp}"
         )
         stat_embed.set_image(
@@ -648,10 +559,6 @@ class DatabaseInteraction(commands.Cog):
             # Periodic trigger that updates all the stat embeds that are pinned.
             print("Period trigger of the embed update.")
 
-            print("Running db update")
-            db_update = await self._update_db()
-            await self.report_db_update_result(db_update)
-
             pirate_steve_db.execute("SELECT * FROM pinned_messages")
             # Get everything
             all_pins = [dict(value) for value in pirate_steve_db.fetchall()]
@@ -710,10 +617,7 @@ class DatabaseInteraction(commands.Cog):
     
     """
 
-    @app_commands.command(
-        name="update_booze_db",
-        description="Populates the booze cruise database from the updated google sheet. Somm/Conn role required.",
-    )
+    @app_commands.command(description="Populates the booze cruise database from a CSV file. Somm/Conn role required.")
     @check_roles(
         [
             *server_council_role_ids(),
@@ -723,28 +627,57 @@ class DatabaseInteraction(commands.Cog):
         ]
     )
     @check_command_channel(get_steve_says_channel())
-    async def user_update_database_from_googlesheets(
-        self, interaction: discord.Interaction
+    async def update_booze_db(
+        self,
+        interaction: discord.Interaction,
+        attachment: discord.Attachment,
     ):
         """
-        Slash command for updating the database from the GoogleSheet.
+        Slash command for updating the database from a CSV file.
 
         :returns: A discord embed to the user.
         :rtype: None
         """
-        print(
-            f"User {interaction.user.name} requested to re-populate the database at {datetime.now()}"
-        )
-
+        print(f"User {interaction.user.name} requested to re-populate the database at {datetime.now()}")
         await interaction.response.defer()
+        if not attachment.filename.endswith(".csv"):
+            await interaction.followup.send("The attachment must be a CSV file.")
+        with NamedTemporaryFile(suffix='.csv', delete_on_close=False) as temp_file:
+            await attachment.save(temp_file.name)
+            temp_file.close()
+            try:
+                await self.report_db_update_result(self._update_db(temp_file.name), force_embed=True)  # TODO
+                await interaction.followup.send(content="Pirate Steve's DB Update ran successfully.")
 
-        try:
-            db_update = await self._update_db()
-            await self.report_db_update_result(db_update, force_embed=True)
-            await interaction.followup.send(content="Pirate Steve's DB Update ran successfully.")
+            except ValueError as ex:
+                await interaction.followup.send(content=str(ex))
 
-        except ValueError as ex:
-            await interaction.followup.send(content=str(ex))
+
+    @app_commands.command(description="Get the booze cruise database as a CSV file. Somm/Conn role required.")
+    @check_roles(
+        [
+            *server_council_role_ids(),
+            server_mod_role_id(),
+            server_sommelier_role_id(),
+            server_connoisseur_role_id(),
+        ]
+    )
+    @check_command_channel(get_steve_says_channel())
+    async def download_booze_db(self, interaction: discord.Interaction):
+        print(f"User {interaction.user.name} requested to download the database at {datetime.now()}")
+        await interaction.response.defer()
+        # Get all carriers
+        pirate_steve_db.execute("SELECT * FROM boozecarriers")
+        all_carrier_data = [BoozeCarrier(carrier) for carrier in pirate_steve_db.fetchall()]
+        with NamedTemporaryFile(mode="w", suffix=".csv", delete_on_close=False) as temp_file:
+            writer = DictWriter(temp_file, fieldnames=BoozeCarrier.DICT_MAPPING.keys(), extrasaction='ignore')
+            writer.writerow(BoozeCarrier.DICT_MAPPING)
+            for carrier in all_carrier_data:
+                writer.writerow(carrier.to_dictionary())
+            temp_file.close()
+            csv_file = discord.File(temp_file.name, filename="boozecarriers.csv")
+            await interaction.followup.send(file=csv_file, content="Here are the wine carriers as a CSV file.")
+
 
     @app_commands.command(
         name="find_carriers_with_wine",
@@ -770,8 +703,6 @@ class DatabaseInteraction(commands.Cog):
         """
 
         await interaction.response.defer()
-        db_update = await self._update_db()
-        await self.report_db_update_result(db_update)
         print(f"{interaction.user.name} requested to find the carrier with wine")
         pirate_steve_db.execute(
             "SELECT * FROM boozecarriers WHERE runtotal > totalunloads"
@@ -818,8 +749,6 @@ class DatabaseInteraction(commands.Cog):
         """
 
         await interaction.response.defer()
-        db_update = await self._update_db()
-        await self.report_db_update_result(db_update)
         print(
             f"{interaction.user.name} wants to forcefully mark the carrier {carrier_id} as unloaded."
         )
@@ -927,22 +856,10 @@ class DatabaseInteraction(commands.Cog):
             )
 
     @app_commands.command(
-        name="find_wine_carriers_for_platform",
-        description="Returns the carriers in the database for the platform.",
+        name="find_wine_carriers",
+        description="Returns the carriers in the database.",
     )
-    @describe(
-        platform="The platform the carrier operates on.",
-        remaining_wine="True if you only want carriers with wine, else False. Default True",
-    )
-    @app_commands.choices(
-        platform=[
-            Choice(name="PC (All)", value="PC"),
-            Choice(name="PC EDH", value="PC (Horizons Only)"),
-            Choice(name="PC EDO", value="PC (Horizons + Odyssey)"),
-            Choice(name="Xbox", value="Xbox"),
-            Choice(name="Playstation", value="Playstation"),
-        ]
-    )
+    @describe(remaining_wine="True if you only want carriers with wine, else False. Default True")
     @check_roles(
         [
             *server_council_role_ids(),
@@ -953,10 +870,9 @@ class DatabaseInteraction(commands.Cog):
         ]
     )
     @check_command_channel([get_wine_carrier_channel(), get_steve_says_channel()])
-    async def find_carriers_for_platform(
+    async def find_carriers(
         self,
         interaction: discord.Interaction,
-        platform: str,
         remaining_wine: bool = True,
     ):
         """
@@ -969,34 +885,28 @@ class DatabaseInteraction(commands.Cog):
         """
 
         await interaction.response.defer()
-        db_update = await self._update_db()
-        await self.report_db_update_result(db_update)
         print(
-            f"{interaction.user.name} requested to fine carriers for: {platform} with wine: {remaining_wine}"
+            f"{interaction.user.name} requested to fine carriers with wine: {remaining_wine}"
         )
 
         if remaining_wine:
-            data = (f"%{platform}%",)
-            carrier_search = "platform LIKE (?) and runtotal > totalunloads"
-
+            carrier_search = "runtotal > totalunloads"
         else:
-            data = (f"%{platform}%",)
-            carrier_search = "platform LIKE (?)"
+            carrier_search = "1=1"
 
         # Check if it is in the database already
         pirate_steve_db.execute(
-            f"SELECT * FROM boozecarriers WHERE {carrier_search}", data
+            f"SELECT * FROM boozecarriers WHERE {carrier_search}"
         )
         # Really only expect a single entry here, unique field and all that
         carrier_data = [BoozeCarrier(carrier) for carrier in pirate_steve_db.fetchall()]
 
-        print(f"Found {len(carrier_data)} carriers matching the search")
-
         if not carrier_data:
             print(f"Did not find a carrier matching the condition: {carrier_search}.")
             return await interaction.edit_original_response(
-                content=f"Could not find a carrier matching the inputs: {platform}, with wine: {remaining_wine}"
+                content=f"Could not find a carrier matching the inputs: with wine: {remaining_wine}"
             )
+        print(f"Found {len(carrier_data)} carriers matching the search")
 
         carrier_data = [
             (f"{carrier.carrier_name} ({carrier.carrier_identifier})", f"{carrier.wine_total // carrier.run_count} tonnes of wine on {carrier.platform}") for carrier in carrier_data
@@ -1027,8 +937,6 @@ class DatabaseInteraction(commands.Cog):
         self, interaction: discord.Interaction, carrier_id: str
     ):
         await interaction.response.defer()
-        db_update = await self._update_db()
-        await self.report_db_update_result(db_update)
         print(f"{interaction.user.name} wants to find a carrier by ID: {carrier_id}.")
         # Cast this to upper case just in case
         carrier_id = carrier_id.upper()
@@ -1068,8 +976,7 @@ class DatabaseInteraction(commands.Cog):
         return await interaction.edit_original_response(embed=carrier_embed)
 
     @app_commands.command(
-        name="booze_tally",
-        description="Returns a summary of the stats for the current booze cruise. Restricted to Somms and Connoisseurs.",
+        description="Returns a summary of the stats for the current booze cruise. Restricted to Somms and Connoisseurs."
     )
     @describe(
         cruise_select="Which cruise do you want data for. 0 is this cruise, 1 the last cruise etc. Default is this cruise."
@@ -1082,7 +989,7 @@ class DatabaseInteraction(commands.Cog):
             server_connoisseur_role_id(),
         ]
     )
-    async def tally(self, interaction: discord.Interaction, cruise_select: int = 0):
+    async def booze_tally(self, interaction: discord.Interaction, cruise_select: int = 0):
         """
         Returns an embed inspired by (cloned from) @CMDR Suiseiseki's b.tally. Provided to keep things in one place
         is all.
@@ -1100,9 +1007,6 @@ class DatabaseInteraction(commands.Cog):
             f"User {interaction.user.name} requested the current tally of the cruise stats for {cruise} cruise."
         )
         target_date = None
-
-        db_update = await self._update_db()
-        await self.report_db_update_result(db_update)
 
         if cruise_select == 0:
             # Go get everything out of the database
@@ -1156,9 +1060,9 @@ class DatabaseInteraction(commands.Cog):
         await interaction.edit_original_response(embed=stat_embed)
 
         if cruise_select == 0:
-            
+
             pinned_stat_embed = self.build_stat_embed(all_carrier_data, total_carriers_multiple_trips, None, True)
-            
+
             # Go update all the pinned embeds also.
             pirate_steve_db.execute("""SELECT * FROM pinned_messages""")
             pins = [dict(value) for value in pirate_steve_db.fetchall()]
@@ -1175,14 +1079,13 @@ class DatabaseInteraction(commands.Cog):
                 print("No pinned messages up update")
 
     @app_commands.command(
-        name="booze_pin_message",
-        description="Pins a steve tally embed for periodic updating. Restricted to Admin and Sommelier's.",
+        description="Pins a steve tally embed for periodic updating. Restricted to Admin and Somms.",
     )
     @describe(message_link="The message link to be pinned")
     @check_roles(
         [*server_council_role_ids(), server_mod_role_id(), server_sommelier_role_id()]
     )
-    async def pin_message(self, interaction: discord.Interaction, message_link: str):
+    async def booze_pin_message(self, interaction: discord.Interaction, message_link: str):
         """
         Pins the message in the channel.
 
@@ -1250,14 +1153,13 @@ class DatabaseInteraction(commands.Cog):
         )
 
     @app_commands.command(
-        name="booze_unpin_all",
-        description="Unpins all messages for booze stats and updates the DB. Restricted to Admin and Sommelier's.",
+        description="Unpins all messages for booze stats and updates the DB. Restricted to Admin and Somms.",
     )
     @check_roles(
         [*server_council_role_ids(), server_mod_role_id(), server_sommelier_role_id()]
     )
     @check_command_channel([get_steve_says_channel()])
-    async def clear_all_pinned_message(self, interaction: discord.Interaction):
+    async def booze_unpin_all(self, interaction: discord.Interaction):
         """
         Clears all the pinned messages
 
@@ -1299,9 +1201,7 @@ class DatabaseInteraction(commands.Cog):
             )
 
     @app_commands.command(
-        name="booze_unpin_message",
-        description="Unpins a specific message and removes it from the DB. Restricted to Admin and "
-        "Sommelier's.",
+        description="Unpins a specific message and removes it from the DB. Restricted to Admin and Somms.",
     )
     @check_roles(
         [*server_council_role_ids(), server_mod_role_id(), server_sommelier_role_id()]
@@ -1362,7 +1262,6 @@ class DatabaseInteraction(commands.Cog):
             )
 
     @app_commands.command(
-        name="booze_tally_extra_stats",
         description="Returns an set of extra stats for the wine. Restricted to Admin, Sommeliers, and Connoisseurs.",
     )
     @describe(
@@ -1376,9 +1275,7 @@ class DatabaseInteraction(commands.Cog):
             server_connoisseur_role_id(),
         ]
     )
-    async def extended_tally_stats(
-        self, interaction: discord.Interaction, cruise_select: int = 0
-    ):
+    async def booze_tally_extra_stats(self, interaction: discord.Interaction, cruise_select: int = 0):
         """
         Prints an extended tally stats as requested by RandomGazz.
 
@@ -1392,9 +1289,6 @@ class DatabaseInteraction(commands.Cog):
         print(
             f"User {interaction.user.name} requested the current extended stats of the cruise."
         )
-
-        db_update = await self._update_db()
-        await self.report_db_update_result(db_update)
 
         cruise = "this" if cruise_select == 0 else f"-{cruise_select}"
         print(
@@ -1454,7 +1348,6 @@ class DatabaseInteraction(commands.Cog):
         await interaction.edit_original_response(embed=stat_embed)
 
     @app_commands.command(
-        name="booze_carrier_summary",
         description="Returns a summary of booze carriers. Restricted to Admin, Sommeliers, and Connoisseurs.",
     )
     @check_roles(
@@ -1517,16 +1410,13 @@ class DatabaseInteraction(commands.Cog):
         )
         await interaction.edit_original_response(embed=stat_embed)
 
-    @app_commands.command(
-        name="booze_delete_carrier",
-        description="Removes a carrier from the database. Admin/Sommelier required.",
-    )
+    @app_commands.command(description="Removes a carrier from the database. Admin/Sommelier required.")
     @describe(carrier_id="The XXX-XXX ID string for the carrier")
     @check_roles(
         [*server_council_role_ids(), server_mod_role_id(), server_sommelier_role_id()]
     )
     @check_command_channel(get_steve_says_channel())
-    async def remove_carrier(self, interaction: discord.Interaction, carrier_id: str):
+    async def booze_delete_carrier(self, interaction: discord.Interaction, carrier_id: str):
         """
         Removes a carrier entry from the database after confirmation.
 
@@ -1638,15 +1528,12 @@ class DatabaseInteraction(commands.Cog):
                 content="**Cancelled - timed out**", embed=None
             )
 
-    @app_commands.command(
-        name="booze_archive_database",
-        description="Archives the boozedatabase. Admin/Sommelier required.",
-    )
+    @app_commands.command(description="Archives the boozedatabase. Admin/Sommelier required.")
     @check_roles(
         [*server_council_role_ids(), server_mod_role_id(), server_sommelier_role_id()]
     )
     @check_command_channel(get_steve_says_channel())
-    async def archive_database(self, interaction: discord.Interaction):
+    async def booze_archive_database(self, interaction: discord.Interaction):
         """
         Performs the steps to archive the current booze cruise database. Only possible if we are not in a PH
         currently and if the data has not been archived. Once archived it will be dropped.
@@ -1814,61 +1701,12 @@ class DatabaseInteraction(commands.Cog):
                 content="**Waiting for user response - timed out**", embed=None
             )
 
-    @app_commands.command(
-        name="booze_configure_signup_forms",
-        description="Updates the booze cruise signup forms. Admin/Sommelier required.",
-    )
-    @check_roles(
-        [*server_council_role_ids(), server_mod_role_id(), server_sommelier_role_id()]
-    )
+    @app_commands.command(description="Allow signups for a new cruise. Admin/Sommelier required.")
+    @check_roles([*server_council_role_ids(), server_mod_role_id(), server_sommelier_role_id()])
     @check_command_channel(get_steve_says_channel())
-    async def configure_signup_forms(self, interaction: discord.Interaction):
-        """
-        Reconfigures the signup sheet and the tracking sheet to the new forms. Only usable by an admin.
-
-        :param interaction discord.Interaction: The discord interaction context.
-        :returns: None
-        """
-
+    async def booze_new_cruise(self, interaction: discord.Interaction):
         await interaction.response.defer()
-        print(
-            f"{interaction.user.name} wants to reconfigure the booze cruise signup forms."
-        )
-
-        # Store the current states just in case we need them
-        original_sheet_id = self.worksheet_with_data_id
-        original_worksheet_key = self.worksheet_key
-        original_loader_signup_form = self.loader_signup_form_url
-
-        # track the init value, we reset to this in case of bail out
-        init_update_value = self.update_allowed
-        self.update_allowed = False
-        new_sheet_id = None
-        new_worksheet_key = None
-        new_loader_signup_form = None
-
-        def check_yes_no(check_message):
-            return (
-                check_message.author == interaction.user
-                and check_message.channel == interaction.channel
-                and check_message.content.lower() in ["y", "n"]
-            )
-
-        def check_author(check_message):
-            return (
-                check_message.author == interaction.user
-                and check_message.channel == interaction.channel
-            )
-
-        def check_id(check_message):
-            return (
-                check_message.author == interaction.user
-                and check_message.channel == interaction.channel
-                and re.match(r"^\d*$", check_message.content)
-            )
-
-        # TODO: See if we can add a validation for the URL
-
+        print(f"{interaction.user.name} wants to enable signups for a new booze cruise.")
         # Check the dB is empty first.
         pirate_steve_db.execute("SELECT * FROM boozecarriers")
         all_carrier_data = [
@@ -1877,272 +1715,40 @@ class DatabaseInteraction(commands.Cog):
         if all_carrier_data:
             # archive the database first else we will end up in issues
             return await interaction.edit_original_response(
-                content="Pirate Steve has data already for a cruise - go fix his memory by running the "
-                "archive command first."
+                content="Pirate Steve has data already for a cruise - go fix his memory by running the archive command first."
             )
-
-        await interaction.edit_original_response(
-            content="Pirate Steve first wants the loader signup form URL."
-        )
-        try:
-            # in this case we do not know the shape of the URL
-            response = await bot.wait_for("message", check=check_author, timeout=30)
-            if response:
-                print(f"We have data: {response.content} for the signup URL.")
-                new_loader_signup_form = response.content
-                await response.delete()
-
-        except asyncio.TimeoutError:
-            self.update_allowed = True
-            print("Error getting the response for the google signup form.")
-            return await interaction.edit_original_response(
-                content="Pirate Steve saw you timed out.", embed=None
-            )
-
-        await interaction.edit_original_response(
-            content="Pirate Steve secondly wants the sheet ID for the form. Start "
-            "counting from 1 and Pirate Steve will tell the computer "
-            "accordingly.",
-            embed=None,
-        )
-        try:
-            response = await bot.wait_for("message", check=check_id, timeout=30)
-            if response:
-                print(f"We have data: {response.content} for the worksheet ID.")
-                try:
-                    # user counts 1, 2, 3. Computer 0, 1, 2
-                    new_sheet_id = int(response.content) - 1
-                    if new_sheet_id < 0:
-                        raise ValueError("Error ID is less than 0")
-                    await response.delete()
-                except ValueError:
-                    self.update_allowed = init_update_value
-                    await response.delete()
-                    return await interaction.edit_original_response(
-                        content=f"Pirate Steve thinks you do not know what an integer starting from 1 is."
-                        f" {response.content}. Start again!",
-                        embed=None,
-                    )
-
-        except asyncio.TimeoutError:
-            print("Error getting the response for the worksheet key.")
-            self.update_allowed = True
-            return await interaction.edit_original_response(
-                content="Pirate Steve saw you timed out on step 2.", embed=None
-            )
-
-        await interaction.edit_original_response(
-            content="Pirate Steve thirdly wants to know the key for the data. The Key is "
-            "the long unique string in the URL.",
-            embed=None,
-        )
-        try:
-            # in this case we do not know the shape of the worksheet Key, it is a unique value.
-            response = await bot.wait_for("message", check=check_author, timeout=30)
-            if response:
-                print(f"We have data: {response.content} for the worksheet unique key.")
-                new_worksheet_key = response.content
-                await response.delete()
-
-        except asyncio.TimeoutError:
-            print("Error getting the response for the worksheet key.")
-            self.update_allowed = init_update_value
-            return await interaction.edit_original_response(
-                content="Pirate Steve saw you timed out on step 3.", embed=None
-            )
-
-        print(
-            f"We received valid data for all points, confirm them with the {interaction.user.name} it is correct."
+        self.signups_allowed = True
+        embed = discord.Embed(
+            title="Cruise Signups enabled.",
+            description="Users can now sign up for the new cruise. Use `/booze_toggle_signups` to pause signups.",
         )
 
-        confirm_embed = discord.Embed(
-            title="Pirate Steve wants you to confirm the new values.",
-            description=f"**New signup URL:** {new_loader_signup_form}\n"
-            f"**New worksheet key:** {new_worksheet_key}\n"
-            f"**New worksheet ID:** {new_sheet_id + 1}.",
-        )
-        confirm_embed.set_footer(text="Confirm this with y/n.")
+        await interaction.edit_original_response(content=None, embed=embed)
 
-        await interaction.edit_original_response(content=None, embed=confirm_embed)
 
-        try:
-            user_response = await bot.wait_for(
-                "message", check=check_yes_no, timeout=30
-            )
-            if user_response.content.lower() == "y":
-                print(f"{interaction.user.name} confirms to write the database now.")
-                await user_response.delete()
-
-                try:
-                    pirate_steve_lock.acquire()
-
-                    data = (
-                        new_worksheet_key,
-                        new_loader_signup_form,
-                        new_sheet_id,
-                    )
-                    pirate_steve_db.execute(
-                        """
-                        UPDATE trackingforms 
-                        SET worksheet_key=?, loader_input_form_url=?, worksheet_with_data_id=?
-                      """,
-                        data,
-                    )
-
-                    pirate_steve_conn.commit()
-                    dump_database()
-                finally:
-                    pirate_steve_lock.release()
-
-                self.worksheet_key = new_worksheet_key
-                self.worksheet_with_data_id = new_sheet_id
-                self.loader_signup_form_url = new_loader_signup_form
-                self.update_allowed = True
-                try:
-
-                    # Now go make the new updates to pull the data initially
-                    await self._reconfigure_workbook_and_form()
-                    db_update = await self._update_db()
-                    await self.report_db_update_result(db_update)
-
-                except OSError as e:
-                    self.update_allowed = init_update_value
-                    return await interaction.edit_original_response(
-                        content=f"Pirate steve reports an error while updating things: {e}. Fix it and try "
-                        f"again.",
-                        embed=None,
-                    )
-
-                return await interaction.edit_original_response(
-                    content="Pirate Steve unfurled out the sails and is now catching the wind with the new "
-                    "values! Try `/update_booze_db` to check progress.",
-                    embed=None,
-                )
-
-            elif user_response.content.lower() == "n":
-                print(
-                    f"User {interaction.user.name} wants to abort the archive process."
-                )
-                await user_response.delete()
-                self.update_allowed = init_update_value
-                return await interaction.edit_original_response(
-                    content="You aborted the request to update the forms.", embed=None
-                )
-
-        except asyncio.TimeoutError:
-            print("Error getting the confirmation response")
-            self.update_allowed = init_update_value
-            return await interaction.edit_original_response(
-                content="Pirate Steve saw you timed on the confirmation.", embed=None
-            )
-
-    @app_commands.command(
-        name="booze_reuse_signup_forms",
-        description="Reuses the current the booze cruise signup forms. Admin/Sommelier required.",
-    )
-    @check_roles(
-        [*server_council_role_ids(), server_mod_role_id(), server_sommelier_role_id()]
-    )
+    @app_commands.command(description="Toggle signups for a cruise. Admin/Sommelier required.")
+    @check_roles([*server_council_role_ids(), server_mod_role_id(), server_sommelier_role_id()])
     @check_command_channel(get_steve_says_channel())
-    async def reuse_signup_forms(self, interaction: discord.Interaction):
-        """
-        Reuses the signup sheet and the tracking sheet. And re unlocks the db. Only usable by an admin.
-
-        :param interaction discord.Interaction: The discord interaction context.
-        :returns: None
-        """
-
-        await interaction.response.defer()
-        print(
-            f"{interaction.user.name} wants to reconfigure the booze cruise signup forms."
+    async def booze_toggle_signups(self, interaction: discord.Interaction):
+        print(f"{interaction.user.name} wants to toggle signups for the current cruise.")
+        self.signups_allowed = not self.signups_allowed
+        status = "enabled" if self.signups_allowed else "disabled"
+        embed = discord.Embed(
+            title=f"Cruise Signups {status}.", description=f"User signups for the cruise are now {status}",
         )
+        await interaction.edit_original_response(content=None, embed=embed)
 
-        # Store the current states just in case we need them
-        original_sheet_id = self.worksheet_with_data_id
-        original_worksheet_key = self.worksheet_key
-        original_loader_signup_form = self.loader_signup_form_url
 
-        # track the init value, we reset to this in case of bail out
-        init_update_value = self.update_allowed
-        self.update_allowed = False
-
-        # Check the dB is empty first.
-        pirate_steve_db.execute("SELECT * FROM boozecarriers")
-        all_carrier_data = [
-            BoozeCarrier(carrier) for carrier in pirate_steve_db.fetchall()
-        ]
-        if all_carrier_data:
-            # archive the database first else we will end up in issues
-            return await interaction.edit_original_response(
-                content="Pirate Steve has data already for a cruise - go fix his memory by running the "
-                "archive command first."
-            )
-
-        def check_yes_no(check_message):
-            return (
-                check_message.author == interaction.user
-                and check_message.channel == interaction.channel
-                and check_message.content.lower() in ["y", "n"]
-            )
-
-        confirm_embed = discord.Embed(
-            title="Pirate Steve wants you to confirm the values.",
-            description=f"**Signup URL:** {original_loader_signup_form}\n"
-            f"**Worksheet key:** {original_worksheet_key}\n"
-            f"**Worksheet ID:** {original_sheet_id + 1}.",
-        )
-        confirm_embed.set_footer(text="Confirm this with y/n.")
-
-        await interaction.edit_original_response(content=None, embed=confirm_embed)
-
-        try:
-            user_response = await bot.wait_for(
-                "message", check=check_yes_no, timeout=30
-            )
-            if user_response.content.lower() == "y":
-                await user_response.delete()
-
-                self.worksheet_key = original_worksheet_key
-                self.worksheet_with_data_id = original_sheet_id
-                self.loader_signup_form_url = original_loader_signup_form
-                self.update_allowed = True
-                try:
-
-                    # Now go make the new updates to pull the data initially
-                    await self._reconfigure_workbook_and_form()
-                    db_update = await self._update_db()
-                    await self.report_db_update_result(db_update)
-
-                except OSError as e:
-                    self.update_allowed = init_update_value
-                    return await interaction.edit_original_response(
-                        content=f"Pirate steve reports an error while updating things: {e}. Fix it and try "
-                        f"again.",
-                        embed=None,
-                    )
-
-                return await interaction.edit_original_response(
-                    content="Pirate Steve unfurled out the sails and is now catching the wind with the new "
-                    "values! Try `/update_booze_db` to check progress.",
-                    embed=None,
-                )
-
-            elif user_response.content.lower() == "n":
-                print(
-                    f"User {interaction.user.name} wants to abort the archive process."
-                )
-                await user_response.delete()
-                self.update_allowed = init_update_value
-                return await interaction.edit_original_response(
-                    content="You aborted the request to update the forms.", embed=None
-                )
-
-        except asyncio.TimeoutError:
-            print("Error getting the confirmation response")
-            self.update_allowed = init_update_value
-            return await interaction.edit_original_response(
-                content="Pirate Steve saw you timed on the confirmation.", embed=None
-            )
+    @app_commands.command(description="Sign up as a Wine Carrier Owner.")
+    @check_roles([*server_council_role_ids(), server_mod_role_id(), server_sommelier_role_id()])
+    @check_command_channel(get_steve_says_channel())
+    async def booze_carrier_signup(self, interaction: discord.Interaction):
+        print(f"{interaction.user.name} wants to sign up as WCO for the current cruise.")
+        if not self.signups_allowed:
+            embed = discord.Embed(description="Wine Carrier signups for the cruise are currently disabled")
+            return await interaction.edit_original_response(content=None, embed=embed)
+        await interaction.response.defer(ephemeral=True)
+        # TODO: Reply with modal to confirm signup
 
 
     @app_commands.command(name="biggest_cruise_tally", description="Returns the tally for the cruise with the most wine.")
@@ -2151,9 +1757,9 @@ class DatabaseInteraction(commands.Cog):
         """
         Returns the tally for the cruise with the most wine.
 
-        :param interaction discord.Interaction: The discord interaction context.
+        :param discord.Interaction interaction: The discord interaction context.
         :param bool extended: If the extended stats should be shown.
-        :returns: None"
+        :returns: None
         """
 
         print(f"{interaction.user.name} requested the biggest cruise tally, extended: {extended}.")
