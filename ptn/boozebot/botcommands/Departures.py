@@ -210,13 +210,15 @@ class Departures(commands.Cog):
             except Exception as e:
                 print(f"Failed to process departure message while checking for time passed. message: {message.id}. Error: {e}")
 
-    @app_commands.command(name="wine_carrier_departure",
-                          description="Post a departure message for a wine carrier.")
+    @app_commands.command(name="wine_carrier_departure", description="Post a departure message for a wine carrier.")
     @describe(carrier_id="The XXX-XXX ID string for the carrier")
     @check_roles([*server_council_role_ids(), server_mod_role_id(), server_sommelier_role_id(), server_connoisseur_role_id(), server_wine_carrier_role_id()])
     @check_command_channel(wine_carrier_command_channel())
     @app_commands.choices(arrival_location=system_choices, departure_location=system_choices)
-    async def wine_carrier_departure(self, interaction: discord.Interaction, carrier_id: str, departure_location: str, arrival_location: str, departing_at: str = None, departing_in: str = None):
+    async def wine_carrier_departure(
+        self, interaction: discord.Interaction, carrier_id: str, departure_location: str, arrival_location: str,
+        departing_at: str = None, departing_in: str = None
+    ):
         """
         Handles the wine carrier departure operation.
 
@@ -232,7 +234,32 @@ class Departures(commands.Cog):
         # Log the request
         print(f'User {interaction.user.name} has requested a new wine carrier departure operation for carrier: {carrier_id} from the '
               f'location: {departure_location} to {arrival_location}.')
+        await self._carrier_departure(interaction, carrier_id, departure_location, arrival_location, departing_at, departing_in)
 
+
+    @app_commands.command(name="wine_shuttle_departure", description="Post a departure message for a wine shuttle.")
+    @describe(carrier_id="The XXX-XXX ID string for the carrier")
+    @check_roles([*server_council_role_ids(), server_mod_role_id(), server_sommelier_role_id()])
+    @check_command_channel(wine_carrier_command_channel())
+    @app_commands.choices(arrival_location=system_choices, departure_location=system_choices)
+    async def wine_shuttle_departure(
+        self, interaction: discord.Interaction, carrier_id: str, departure_location: str, arrival_location: str,
+        departing_at: str = None, departing_in: str = None
+    ):
+        """Handles the shuttle departure operation."""
+
+        # Log the request
+        print(f'User {interaction.user.name} has requested a new wine carrier departure operation for carrier: {carrier_id} from the '
+              f'location: {departure_location} to {arrival_location}.')
+        await self._carrier_departure(
+            interaction, carrier_id, departure_location, arrival_location, departing_at, departing_in, is_shuttle=True
+        )
+
+
+    async def _carrier_departure(
+        self, interaction: discord.Interaction, carrier_id: str, departure_location: str, arrival_location: str,
+        departing_at: str = None, departing_in: str = None, is_shuttle: bool = False
+    ):
         # Defer the interaction response to allow more time for processing
         await interaction.response.defer(ephemeral=True)
 
@@ -385,7 +412,10 @@ class Departures(commands.Cog):
 
         # Send the departure message to the departure announcement channel
         departure_channel = bot.get_channel(get_departure_announcement_channel())
-        departure_message = await departure_channel.send(departure_message_text)
+        if is_shuttle:
+            departure_message = await departure_channel.send(embed=discord.Embed(description=departure_message_text))
+        else:
+            departure_message = await departure_channel.send(departure_message_text)
         await departure_message.add_reaction("🛬")
         await departure_message.add_reaction("✅")
         print("Departure message sent.")
